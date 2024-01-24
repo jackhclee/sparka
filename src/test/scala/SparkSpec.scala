@@ -1,12 +1,22 @@
 import com.bedrockstreaming.data.sparktest.{DataFrameEquality, SparkTestSupport}
 import io.github.embeddedkafka.{EmbeddedKafka, EmbeddedKafkaConfig}
 import io.github.embeddedkafka.EmbeddedKafkaConfig.defaultConfig.kafkaPort
+import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.serialization.{Serializer, StringDeserializer, StringSerializer}
 import org.apache.kafka.coordinator.group.runtime.CoordinatorLoader.Deserializer
 import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.functions.expr
+import org.apache.spark.sql.functions.{explode, expr}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+import org.json4s.jackson.Serialization.{read, write}
+import org.json4s.JsonDSL._
+import org.json4s.jackson.Serialization
+
+import java.time.Instant
+
+case class Book(id: Int, name: String)
 
 class SparkSpec extends AnyFlatSpec with Matchers with EmbeddedKafka with SparkTestSupport with DataFrameEquality {
 
@@ -29,18 +39,45 @@ class SparkSpec extends AnyFlatSpec with Matchers with EmbeddedKafka with SparkT
       val key   = "key"
       val value = "value"
       val topic = "topic"
-      publishToKafka(topic = topic, message = "{\"id\":1,\"name\":\"Apple\"}")
-      publishToKafka(topic = topic, message = "{\"id\":2,\"name\":\"Banana\"}")
+
+      def createRec(ctr: Int): ProducerRecord[String, String] = {
+        implicit val fmts : Formats = Serialization.formats(NoTypeHints)
+        val rec = new ProducerRecord[String, String](
+          topic,
+          0,
+          Instant.parse(s"2011-12-0${ctr}T10:15:30Z").toEpochMilli,
+          s"K${ctr}",
+          write(Book(ctr, "Apple"))
+        )
+        rec.headers().add("version", "10".getBytes)
+        rec.headers().add("author", "jack".getBytes)
+        rec
+      }
+      withProducer[String, String, Unit](producer => {
+        Range(1,9).map( i => createRec(i)).foreach(rec => producer.send(rec))
+      })
+//      publishToKafka(topic = topic, message = "{\"id\":1,\"name\":\"Apple\"}")
+//      publishToKafka(topic = topic, message = "{\"id\":2,\"name\":\"Banana\"}")
 
       val kafkaDf = spark
         .read
         .format("kafka")
         .option("kafka.bootstrap.servers", s"127.0.0.1:$kafkaPort")
         .option("subscribe", topic)
+        .option("includeHeaders", "true")
         .load
-        .withColumn("valueStr", $"value".cast("STRING"))
+        .withColumn("key_str", $"key".cast("STRING"))
+        .withColumn("value_str", $"value".cast("STRING"))
+        .withColumn("exploded_header", explode($"headers"))
+        .filter("exploded_header.key = 'version'")
+        .withColumn("version", expr("exploded_header.value").cast("STRING"))
 
-      val ds1 = kafkaDf.select($"valueStr").as[String]
+      kafkaDf.printSchema()
+      println("1 ====")
+      kafkaDf.show
+      println("2 ====")
+
+      val ds1 = kafkaDf.select($"value_str").as[String]
       ds1.printSchema()
       ds1.show(truncate = false)
       println("ds1!")
